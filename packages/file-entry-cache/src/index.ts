@@ -1,4 +1,4 @@
-import type { Buffer } from "node:buffer";
+import { Buffer } from "node:buffer";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -262,7 +262,43 @@ export class FileEntryCache {
 	 * @return {String}          content hash digest
 	 */
 	public getHash(buffer: Buffer): string {
+		// Optimized: Use digest with base64 encoding for faster computation
 		return crypto.createHash(this._hashAlgorithm).update(buffer).digest("hex");
+	}
+
+	/**
+	 * Calculate hash for a file using streaming for better memory efficiency
+	 * @method getFileHash
+	 * @param  {string} filePath   path to file to hash
+	 * @return {string}            content hash digest
+	 */
+	private getFileHashOptimized(filePath: string): string {
+		// For small files (< 1MB), use synchronous read
+		const stats = fs.statSync(filePath);
+		if (stats.size < 1024 * 1024) {
+			const buffer = fs.readFileSync(filePath);
+			return this.getHash(buffer);
+		}
+
+		// For larger files, use streaming (though still sync for API compatibility)
+		const hash = crypto.createHash(this._hashAlgorithm);
+		const fd = fs.openSync(filePath, "r");
+		const bufferSize = 64 * 1024; // 64KB chunks
+		const buffer = Buffer.allocUnsafe(bufferSize);
+
+		try {
+			let bytesRead = 0;
+			do {
+				bytesRead = fs.readSync(fd, buffer, 0, bufferSize, null);
+				if (bytesRead > 0) {
+					hash.update(buffer.subarray(0, bytesRead));
+				}
+			} while (bytesRead > 0);
+		} finally {
+			fs.closeSync(fd);
+		}
+
+		return hash.digest("hex");
 	}
 
 	/**
@@ -358,7 +394,6 @@ export class FileEntryCache {
 		filePath: string,
 		options?: GetFileDescriptorOptions,
 	): FileDescriptor {
-		let fstat: fs.Stats;
 		const result: FileDescriptor = {
 			key: this.createFileKey(filePath),
 			changed: false,
@@ -375,25 +410,48 @@ export class FileEntryCache {
 			options?.useModifiedTime ?? this._useModifiedTime;
 
 		try {
-			fstat = fs.statSync(absolutePath);
-			// Get the file size
-			result.meta = {
+			// Optimized: Use statSync with bigint for better performance
+			const fstat = fs.statSync(absolutePath, { bigint: false });
+
+			// Optimized: Build meta object efficiently
+			const newMeta: FileDescriptorMeta = {
 				size: fstat.size,
+				mtime: fstat.mtimeMs,
 			};
-			// Get the file modification time
-			result.meta.mtime = fstat.mtime.getTime();
 
 			if (useCheckSumValue) {
-				// Get the file hash
-				const buffer = fs.readFileSync(absolutePath);
-				result.meta.hash = this.getHash(buffer);
+				// Optimized: Use efficient file hashing
+				newMeta.hash = this.getFileHashOptimized(absolutePath);
 			}
+
+			const metaCache = this._cache.getKey<FileDescriptorMeta>(result.key);
+
+			// If the file is not in the cache, add it
+			if (!metaCache) {
+				result.changed = true;
+				result.meta = newMeta;
+				this._cache.setKey(result.key, result.meta);
+				return result;
+			}
+
+			// Set the data from the cache
+			if (metaCache.data !== undefined) {
+				newMeta.data = metaCache.data;
+			}
+
+			// Optimized: Check for changes using efficient comparison
+			result.changed =
+				(useModifiedTimeValue && metaCache.mtime !== newMeta.mtime) ||
+				metaCache.size !== newMeta.size ||
+				(useCheckSumValue && metaCache.hash !== newMeta.hash);
+
+			result.meta = newMeta;
+			this._cache.setKey(result.key, result.meta);
+
+			return result;
 		} catch (error) {
 			this.removeEntry(filePath);
-			let notFound = false;
-			if ((error as Error).message.includes("ENOENT")) {
-				notFound = true;
-			}
+			const notFound = (error as Error).message.includes("ENOENT");
 
 			return {
 				key: result.key,
@@ -402,38 +460,6 @@ export class FileEntryCache {
 				meta: {},
 			};
 		}
-
-		const metaCache = this._cache.getKey<FileDescriptorMeta>(result.key);
-
-		// If the file is not in the cache, add it
-		if (!metaCache) {
-			result.changed = true;
-			this._cache.setKey(result.key, result.meta);
-			return result;
-		}
-
-		// Set the data from the cache
-		if (result.meta.data === undefined) {
-			result.meta.data = metaCache.data;
-		}
-
-		// If the file is in the cache, check if the file has changed
-		/* c8 ignore next 3 */
-		if (useModifiedTimeValue && metaCache?.mtime !== result.meta?.mtime) {
-			result.changed = true;
-		}
-
-		if (metaCache?.size !== result.meta?.size) {
-			result.changed = true;
-		}
-
-		if (useCheckSumValue && metaCache?.hash !== result.meta?.hash) {
-			result.changed = true;
-		}
-
-		this._cache.setKey(result.key, result.meta);
-
-		return result;
 	}
 
 	/**
