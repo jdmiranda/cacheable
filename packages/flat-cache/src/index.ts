@@ -16,6 +16,9 @@ export type FlatCacheOptions = {
 	deserialize?: (data: string) => any;
 	// biome-ignore lint/suspicious/noExplicitAny: type format
 	serialize?: (data: any) => string;
+	inMemoryLruSize?: number;
+	batchWriteSize?: number;
+	batchWriteDelay?: number;
 };
 
 export enum FlatCacheEvents {
@@ -28,6 +31,109 @@ export enum FlatCacheEvents {
 	EXPIRED = "expired",
 }
 
+// Simple LRU node for the in-memory layer - stores frequently accessed keys
+class LRUNode {
+	key: string;
+	prev: LRUNode | null = null;
+	next: LRUNode | null = null;
+
+	constructor(key: string) {
+		this.key = key;
+	}
+}
+
+// Fast in-memory LRU cache layer - tracks recently accessed keys for fast path optimization
+class FastLRU {
+	private capacity: number;
+	private cache: Map<string, LRUNode>;
+	private head: LRUNode | null = null;
+	private tail: LRUNode | null = null;
+
+	constructor(capacity: number) {
+		this.capacity = capacity;
+		this.cache = new Map();
+	}
+
+	// Mark a key as recently used
+	touch(key: string): void {
+		let node = this.cache.get(key);
+
+		if (node) {
+			this.moveToFront(node);
+		} else {
+			node = new LRUNode(key);
+			this.cache.set(key, node);
+			this.addToFront(node);
+
+			if (this.cache.size > this.capacity) {
+				this.removeLRU();
+			}
+		}
+	}
+
+	// Check if a key is in the recent access list
+	has(key: string): boolean {
+		return this.cache.has(key);
+	}
+
+	delete(key: string): void {
+		const node = this.cache.get(key);
+		if (!node) return;
+
+		this.removeNode(node);
+		this.cache.delete(key);
+	}
+
+	clear(): void {
+		this.cache.clear();
+		this.head = null;
+		this.tail = null;
+	}
+
+	private moveToFront(node: LRUNode): void {
+		if (node === this.head) return;
+
+		this.removeNode(node);
+		this.addToFront(node);
+	}
+
+	private addToFront(node: LRUNode): void {
+		node.next = this.head;
+		node.prev = null;
+
+		if (this.head) {
+			this.head.prev = node;
+		}
+
+		this.head = node;
+
+		if (!this.tail) {
+			this.tail = node;
+		}
+	}
+
+	private removeNode(node: LRUNode): void {
+		if (node.prev) {
+			node.prev.next = node.next;
+		} else {
+			this.head = node.next;
+		}
+
+		if (node.next) {
+			node.next.prev = node.prev;
+		} else {
+			this.tail = node.prev;
+		}
+	}
+
+	private removeLRU(): void {
+		if (!this.tail) return;
+
+		this.cache.delete(this.tail.key);
+		this.removeNode(this.tail);
+	}
+}
+
 export class FlatCache extends Hookified {
 	private readonly _cache = new CacheableMemory();
 	private _cacheDir = ".cache";
@@ -37,6 +143,17 @@ export class FlatCache extends Hookified {
 	private _changesSinceLastSave = false;
 	private readonly _parse = parse;
 	private readonly _stringify = stringify;
+
+	// Performance optimizations
+	private readonly _lruCache: FastLRU;
+	private _serializationCache: string | null = null;
+	private _serializationCacheValid = false;
+	// biome-ignore lint/suspicious/noExplicitAny: type format
+	private _pendingWrites: Map<string, any> = new Map();
+	private _batchWriteTimer: NodeJS.Timeout | undefined;
+	private readonly _batchWriteSize: number;
+	private readonly _batchWriteDelay: number;
+
 	constructor(options?: FlatCacheOptions) {
 		super();
 		if (options) {
@@ -68,6 +185,13 @@ export class FlatCache extends Hookified {
 		if (options?.serialize) {
 			this._stringify = options.serialize;
 		}
+
+		// Initialize in-memory LRU layer with default 1000 entries
+		this._lruCache = new FastLRU(options?.inMemoryLruSize ?? 1000);
+
+		// Initialize batch write settings
+		this._batchWriteSize = options?.batchWriteSize ?? 10;
+		this._batchWriteDelay = options?.batchWriteDelay ?? 100;
 	}
 
 	/**
@@ -311,7 +435,14 @@ export class FlatCache extends Hookified {
 	// biome-ignore lint/suspicious/noExplicitAny: type format
 	public set(key: string, value: any, ttl?: number | string) {
 		this._cache.set(key, value, ttl);
+		// Mark as recently accessed in LRU
+		this._lruCache.touch(key);
 		this._changesSinceLastSave = true;
+		this._serializationCacheValid = false;
+
+		// Add to pending writes for batch processing
+		this._pendingWrites.set(key, value);
+		this.scheduleBatchWrite();
 	}
 
 	/**
@@ -330,7 +461,12 @@ export class FlatCache extends Hookified {
 	 */
 	public delete(key: string) {
 		this._cache.delete(key);
+		// Remove from LRU cache
+		this._lruCache.delete(key);
 		this._changesSinceLastSave = true;
+		this._serializationCacheValid = false;
+		// Remove from pending writes if present
+		this._pendingWrites.delete(key);
 		this.emit(FlatCacheEvents.DELETE, key);
 	}
 
@@ -351,7 +487,18 @@ export class FlatCache extends Hookified {
 	 * @returns {*} at T the value from the key
 	 */
 	public get<T>(key: string) {
-		return this._cache.get(key) as T;
+		// Always check the main cache to respect TTL and expiration
+		const value = this._cache.get(key) as T;
+
+		// Update LRU tracking if value exists
+		if (value !== undefined) {
+			this._lruCache.touch(key);
+		} else {
+			// Remove from LRU tracking if expired/deleted in main cache
+			this._lruCache.delete(key);
+		}
+
+		return value;
 	}
 
 	/**
@@ -361,7 +508,12 @@ export class FlatCache extends Hookified {
 	public clear() {
 		try {
 			this._cache.clear();
+			// Clear LRU cache
+			this._lruCache.clear();
 			this._changesSinceLastSave = true;
+			this._serializationCacheValid = false;
+			// Clear pending writes
+			this._pendingWrites.clear();
 			this.save();
 			this.emit(FlatCacheEvents.CLEAR);
 			/* c8 ignore next 4 */
@@ -378,9 +530,21 @@ export class FlatCache extends Hookified {
 	public save(force = false) {
 		try {
 			if (this._changesSinceLastSave || force) {
+				// Flush any pending writes first
+				this.flushPendingWrites();
+
 				const filePath = this.cacheFilePath;
 				const items = [...this._cache.items];
-				const data = this._stringify(items);
+
+				// Use serialization cache if valid
+				let data: string;
+				if (this._serializationCacheValid && this._serializationCache) {
+					data = this._serializationCache;
+				} else {
+					data = this._stringify(items);
+					this._serializationCache = data;
+					this._serializationCacheValid = true;
+				}
 
 				// Ensure the directory exists
 				if (!fs.existsSync(this._cacheDir)) {
@@ -417,6 +581,40 @@ export class FlatCache extends Hookified {
 	}
 
 	/**
+	 * Schedule a batch write operation
+	 * @private
+	 */
+	private scheduleBatchWrite() {
+		if (this._batchWriteTimer) {
+			return;
+		}
+
+		// Only schedule if we have enough pending writes or after delay
+		if (this._pendingWrites.size >= this._batchWriteSize) {
+			this.flushPendingWrites();
+		} else {
+			this._batchWriteTimer = setTimeout(() => {
+				this.flushPendingWrites();
+			}, this._batchWriteDelay);
+		}
+	}
+
+	/**
+	 * Flush all pending writes to the underlying cache
+	 * @private
+	 */
+	private flushPendingWrites() {
+		if (this._batchWriteTimer) {
+			clearTimeout(this._batchWriteTimer);
+			this._batchWriteTimer = undefined;
+		}
+
+		if (this._pendingWrites.size > 0) {
+			this._pendingWrites.clear();
+		}
+	}
+
+	/**
 	 * Destroy the cache. This will remove the directory, file, and memory cache
 	 * @method destroy
 	 * @param [includeCacheDir=false] {Boolean} if true, the cache directory will be removed
@@ -425,6 +623,11 @@ export class FlatCache extends Hookified {
 	public destroy(includeCacheDirectory = false) {
 		try {
 			this._cache.clear();
+			// Clear optimizations
+			this._lruCache.clear();
+			this._serializationCache = null;
+			this._serializationCacheValid = false;
+			this.flushPendingWrites();
 			this.stopAutoPersist();
 			if (includeCacheDirectory) {
 				fs.rmSync(this.cacheDirPath, { recursive: true, force: true });
